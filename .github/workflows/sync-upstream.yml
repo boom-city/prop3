@@ -1,0 +1,281 @@
+name: Sync from Upstream
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 'Upstream repository (owner/repo)'
+        required: false
+        default: ''
+      upstream_branch:
+        description: 'Upstream branch to sync from'
+        required: false
+        default: 'main'
+      force_sync:
+        description: 'Force sync even if no changes detected'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+  DEFAULT_UPSTREAM: '' # Set your default upstream repo here if needed
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    name: Sync from upstream repository
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Configure upstream
+        id: configure
+        run: |
+          # Determine upstream repository
+          UPSTREAM_REPO="${{ github.event.inputs.upstream_repo }}"
+          if [ -z "$UPSTREAM_REPO" ]; then
+            UPSTREAM_REPO="$DEFAULT_UPSTREAM"
+          fi
+
+          if [ -z "$UPSTREAM_REPO" ]; then
+            echo "⚠ No upstream repository configured"
+            echo "configured=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Add upstream remote if not exists
+          if ! git remote | grep -q "upstream"; then
+            git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          else
+            git remote set-url upstream "https://github.com/$UPSTREAM_REPO.git"
+          fi
+
+          echo "Upstream configured: $UPSTREAM_REPO"
+          echo "configured=true" >> $GITHUB_OUTPUT
+          echo "upstream_repo=$UPSTREAM_REPO" >> $GITHUB_OUTPUT
+
+      - name: Fetch upstream changes
+        if: steps.configure.outputs.configured == 'true'
+        run: |
+          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch }}"
+          echo "Fetching from upstream/$UPSTREAM_BRANCH..."
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Check for changes
+        if: steps.configure.outputs.configured == 'true'
+        id: check_changes
+        run: |
+          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch }}"
+          LOCAL_BRANCH=$(git branch --show-current)
+
+          # Compare with upstream
+          BEHIND=$(git rev-list --count HEAD..upstream/$UPSTREAM_BRANCH)
+          AHEAD=$(git rev-list --count upstream/$UPSTREAM_BRANCH..HEAD)
+
+          echo "Local branch is $BEHIND commits behind and $AHEAD commits ahead of upstream"
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          echo "ahead=$AHEAD" >> $GITHUB_OUTPUT
+
+          if [ "$BEHIND" -gt 0 ] || [ "${{ github.event.inputs.force_sync }}" = "true" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create sync branch
+        if: steps.configure.outputs.configured == 'true' && steps.check_changes.outputs.has_changes == 'true'
+        id: create_branch
+        run: |
+          SYNC_BRANCH="sync-upstream-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$SYNC_BRANCH"
+          echo "branch=$SYNC_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Merge upstream changes
+        if: steps.configure.outputs.configured == 'true' && steps.check_changes.outputs.has_changes == 'true'
+        id: merge
+        run: |
+          UPSTREAM_BRANCH="${{ github.event.inputs.upstream_branch }}"
+
+          # Attempt to merge upstream changes
+          if git merge upstream/$UPSTREAM_BRANCH --no-edit; then
+            echo "✓ Successfully merged upstream changes"
+            echo "merge_success=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚠ Merge conflicts detected"
+            echo "merge_success=false" >> $GITHUB_OUTPUT
+
+            # Get list of conflicted files
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            echo "Conflicted files:"
+            echo "$CONFLICTS"
+            echo "conflicts<<EOF" >> $GITHUB_OUTPUT
+            echo "$CONFLICTS" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Distribute changes to subrepos
+        if: steps.configure.outputs.configured == 'true' && steps.merge.outputs.merge_success == 'true'
+        run: |
+          echo "Analyzing changes for subrepo distribution..."
+
+          # Get list of changed files from the merge
+          CHANGED_FILES=$(git diff --name-only HEAD~1..HEAD)
+
+          # Create a list of affected subrepos
+          CONFIG_FILE=".github/subrepo-config.json"
+          AFFECTED_SUBREPOS=""
+
+          echo "$CHANGED_FILES" | while IFS= read -r file; do
+            # Check which subrepo this file belongs to
+            jq -r '.subrepos[] | select(.prefix as $p | "'"$file"'" | startswith($p + "/")) | .prefix' "$CONFIG_FILE"
+          done | sort -u > affected_subrepos.txt
+
+          if [ -s affected_subrepos.txt ]; then
+            echo "Affected subrepos:"
+            cat affected_subrepos.txt
+            echo "Distribution will happen automatically via push-subrepos workflow"
+          else
+            echo "No subrepo changes detected in upstream sync"
+          fi
+
+      - name: Push sync branch
+        if: steps.configure.outputs.configured == 'true' && steps.merge.outputs.merge_success == 'true'
+        run: |
+          SYNC_BRANCH="${{ steps.create_branch.outputs.branch }}"
+          git push origin "$SYNC_BRANCH"
+
+      - name: Create pull request
+        if: steps.configure.outputs.configured == 'true' && steps.merge.outputs.merge_success == 'true'
+        run: |
+          SYNC_BRANCH="${{ steps.create_branch.outputs.branch }}"
+          UPSTREAM_REPO="${{ steps.configure.outputs.upstream_repo }}"
+          BEHIND="${{ steps.check_changes.outputs.behind }}"
+          AHEAD="${{ steps.check_changes.outputs.ahead }}"
+
+          # Read affected subrepos if they exist
+          AFFECTED_LIST=""
+          if [ -f affected_subrepos.txt ] && [ -s affected_subrepos.txt ]; then
+            AFFECTED_LIST="### Affected Subrepos\n\`\`\`\n$(cat affected_subrepos.txt)\n\`\`\`"
+          fi
+
+          PR_BODY="This PR syncs changes from the upstream repository."
+          PR_BODY="$PR_BODY"$'\n\n'"## Upstream Details"
+          PR_BODY="$PR_BODY"$'\n'"- **Repository:** $UPSTREAM_REPO"
+          PR_BODY="$PR_BODY"$'\n'"- **Branch:** ${{ github.event.inputs.upstream_branch }}"
+          PR_BODY="$PR_BODY"$'\n'"- **Commits behind:** $BEHIND"
+          PR_BODY="$PR_BODY"$'\n'"- **Commits ahead:** $AHEAD"
+          PR_BODY="$PR_BODY"$'\n\n'"## Sync Information"
+          PR_BODY="$PR_BODY"$'\n'"- **Time:** $(date)"
+          PR_BODY="$PR_BODY"$'\n'"- **Triggered by:** ${{ github.event_name }}"
+          PR_BODY="$PR_BODY"$'\n'"- **Force sync:** ${{ github.event.inputs.force_sync }}"
+          PR_BODY="$PR_BODY"$'\n\n'"$AFFECTED_LIST"
+          PR_BODY="$PR_BODY"$'\n\n'"## Next Steps"
+          PR_BODY="$PR_BODY"$'\n'"1. Review the changes"
+          PR_BODY="$PR_BODY"$'\n'"2. Resolve any conflicts if present"
+          PR_BODY="$PR_BODY"$'\n'"3. Merge to trigger automatic distribution to subrepos"
+          PR_BODY="$PR_BODY"$'\n\n'"---"
+          PR_BODY="$PR_BODY"$'\n'"*This PR was automatically generated by the upstream sync workflow.*"
+
+          gh pr create \
+            --title "⬆️ Sync: Update from upstream ($UPSTREAM_REPO)" \
+            --body "$PR_BODY" \
+            --base main \
+            --head "$SYNC_BRANCH" \
+            --label "upstream-sync" \
+            --label "automated"
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+
+      - name: Handle merge conflicts
+        if: steps.configure.outputs.configured == 'true' && steps.merge.outputs.merge_success == 'false'
+        run: |
+          # Abort the merge
+          git merge --abort
+
+          # Create an issue for manual resolution
+          UPSTREAM_REPO="${{ steps.configure.outputs.upstream_repo }}"
+          CONFLICTS="${{ steps.merge.outputs.conflicts }}"
+
+          ISSUE_BODY="Merge conflicts were detected while syncing from upstream."
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Upstream Repository"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"- **Repository:** $UPSTREAM_REPO"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"- **Branch:** ${{ github.event.inputs.upstream_branch }}"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Conflicted Files"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"\`\`\`"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"$CONFLICTS"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"\`\`\`"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Resolution Steps"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"1. Manually fetch and merge upstream changes"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"2. Resolve conflicts in the listed files"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"3. Create a pull request with resolved changes"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"4. Close this issue once resolved"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Commands for manual resolution:"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"\`\`\`bash"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"git remote add upstream https://github.com/$UPSTREAM_REPO.git"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"git fetch upstream"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"git checkout -b resolve-upstream-conflicts"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"git merge upstream/${{ github.event.inputs.upstream_branch }}"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"# Resolve conflicts manually"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"git add ."
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"git commit"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"git push origin resolve-upstream-conflicts"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"\`\`\`"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"---"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"*This issue was automatically created by the upstream sync workflow.*"
+
+          gh issue create \
+            --title "⚠️ Upstream sync conflicts with $UPSTREAM_REPO" \
+            --body "$ISSUE_BODY" \
+            --label "conflict" \
+            --label "upstream-sync" \
+            --label "needs-attention"
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+
+      - name: Create summary
+        if: always()
+        run: |
+          echo "# Upstream Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.configure.outputs.configured }}" != "true" ]; then
+            echo "⚠️ No upstream repository configured" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Upstream:** ${{ steps.configure.outputs.upstream_repo }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Branch:** ${{ github.event.inputs.upstream_branch }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            if [ "${{ steps.check_changes.outputs.has_changes }}" = "true" ]; then
+              echo "**Status:** Changes detected" >> $GITHUB_STEP_SUMMARY
+              echo "- Behind by: ${{ steps.check_changes.outputs.behind }} commits" >> $GITHUB_STEP_SUMMARY
+              echo "- Ahead by: ${{ steps.check_changes.outputs.ahead }} commits" >> $GITHUB_STEP_SUMMARY
+
+              if [ "${{ steps.merge.outputs.merge_success }}" = "true" ]; then
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "✅ Successfully created sync pull request" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "⚠️ Merge conflicts detected - manual resolution required" >> $GITHUB_STEP_SUMMARY
+              fi
+            else
+              echo "**Status:** Already up to date with upstream" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi

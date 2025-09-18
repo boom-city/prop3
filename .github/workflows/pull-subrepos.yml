@@ -1,0 +1,263 @@
+name: Pull from Subrepos
+
+on:
+  # schedule:
+  #   # Run every hour
+  #   - cron: '0 * * * *'
+
+  workflow_dispatch:
+    inputs:
+      subrepo_filter:
+        description: 'Specific subrepo to sync (leave empty for all)'
+        required: false
+        default: ''
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+jobs:
+  pull-changes:
+    runs-on: ubuntu-latest
+    name: Pull changes from subrepos
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Create pull script
+        run: |
+          cat > pull-subrepos.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          CONFIG_FILE=".github/subrepo-config.json"
+          FILTER="${{ github.event.inputs.subrepo_filter }}"
+          CHANGES_DETECTED=false
+          CONFLICTS_DETECTED=false
+          PULL_LOG="pull-log.txt"
+          CONFLICT_LOG="conflict-log.txt"
+
+          # Clear logs
+          > "$PULL_LOG"
+          > "$CONFLICT_LOG"
+
+          echo "Starting pull from subrepos..."
+          echo "Filter: ${FILTER:-none}"
+
+          # Function to pull from a single subrepo
+          pull_subrepo() {
+              local prefix="$1"
+              local remote="$2"
+              local branch="$3"
+
+              echo "----------------------------------------"
+              echo "Checking: $prefix"
+              echo "Remote: $remote"
+              echo "Branch: $branch"
+
+              # Skip if filter is set and doesn't match
+              if [ -n "$FILTER" ] && [[ "$prefix" != *"$FILTER"* ]]; then
+                  echo "Skipping (filtered out)"
+                  return 0
+              fi
+
+              # Create temporary directory for remote repo
+              TEMP_REPO=$(mktemp -d)
+
+              # Clone the remote repository
+              if ! git clone --branch "$branch" "$remote" "$TEMP_REPO" 2>/dev/null; then
+                  echo "⚠ Remote repository not accessible or doesn't exist"
+                  rm -rf "$TEMP_REPO"
+                  return 0
+              fi
+
+              # Check if there are differences
+              cd "$TEMP_REPO"
+              REMOTE_HASH=$(git rev-parse HEAD)
+
+              cd "${{ github.workspace }}"
+
+              # Create prefix directory if it doesn't exist
+              mkdir -p "$prefix"
+
+              # Compare files
+              DIFF_EXISTS=false
+
+              # Use rsync to check for differences
+              if ! rsync -a --dry-run --delete \
+                     --exclude='.git' \
+                     --itemize-changes \
+                     "$TEMP_REPO/" "$prefix/" | grep -q '^'; then
+                  echo "No changes detected from remote"
+                  rm -rf "$TEMP_REPO"
+                  return 0
+              fi
+
+              echo "Changes detected from remote"
+              CHANGES_DETECTED=true
+
+              # Create a branch for the update
+              BRANCH_NAME="sync-$prefix-$(date +%Y%m%d-%H%M%S)"
+              BRANCH_NAME=$(echo "$BRANCH_NAME" | sed 's|/|-|g' | sed 's|[[]||g' | sed 's|[]]||g')
+
+              # Sync files from remote to local
+              rsync -a --delete \
+                    --exclude='.git' \
+                    "$TEMP_REPO/" "$prefix/"
+
+              # Check if there are actual changes to commit
+              if [ -n "$(git status --porcelain)" ]; then
+                  # Add changes
+                  git add "$prefix"
+
+                  # Get last commit message from remote
+                  cd "$TEMP_REPO"
+                  REMOTE_MSG=$(git log -1 --pretty=%B)
+                  cd "${{ github.workspace }}"
+
+                  # Commit changes
+                  COMMIT_MESSAGE="sync: Update $prefix from remote"
+                  COMMIT_MESSAGE="$COMMIT_MESSAGE"$'\n\n'"Remote commit: $REMOTE_HASH"
+                  COMMIT_MESSAGE="$COMMIT_MESSAGE"$'\n'"Remote message: $REMOTE_MSG"
+                  COMMIT_MESSAGE="$COMMIT_MESSAGE"$'\n\n'"[skip ci]"
+                  git commit -m "$COMMIT_MESSAGE"
+
+                  echo "✓ Successfully pulled changes for $prefix" | tee -a "$PULL_LOG"
+              else
+                  echo "No actual file changes after sync"
+              fi
+
+              # Cleanup
+              rm -rf "$TEMP_REPO"
+          }
+
+          # Process all subrepos
+          TOTAL=$(jq -r '.subrepos | length' "$CONFIG_FILE")
+          CURRENT=0
+
+          jq -c '.subrepos[]' "$CONFIG_FILE" | while IFS= read -r subrepo; do
+              prefix=$(echo "$subrepo" | jq -r '.prefix')
+              remote=$(echo "$subrepo" | jq -r '.remote')
+              branch=$(echo "$subrepo" | jq -r '.branch')
+
+              ((CURRENT++))
+              echo "[$CURRENT/$TOTAL] Processing $prefix"
+
+              pull_subrepo "$prefix" "$remote" "$branch"
+          done
+
+          echo "========================================="
+          echo "Pull Summary:"
+          echo "Changes detected: $CHANGES_DETECTED"
+          echo "Conflicts detected: $CONFLICTS_DETECTED"
+
+          if [ "$CHANGES_DETECTED" = "true" ]; then
+              cat "$PULL_LOG"
+          fi
+
+          if [ "$CONFLICTS_DETECTED" = "true" ]; then
+              echo "Conflicts requiring manual resolution:"
+              cat "$CONFLICT_LOG"
+              exit 1
+          fi
+          EOF
+          chmod +x pull-subrepos.sh
+
+      - name: Run pull process
+        id: pull
+        run: |
+          ./pull-subrepos.sh
+
+          # Check if there are changes
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create pull request if changes exist
+        if: steps.pull.outputs.has_changes == 'true'
+        run: |
+          # Create a unique branch name
+          BRANCH_NAME="sync-subrepos-$(date +%Y%m%d-%H%M%S)"
+
+          # Create and switch to new branch
+          git checkout -b "$BRANCH_NAME"
+
+          # Push the branch
+          git push origin "$BRANCH_NAME"
+
+          # Create pull request
+          PR_BODY="This PR contains updates pulled from individual subrepo repositories."
+          PR_BODY="$PR_BODY"$'\n\n'"## Changes"
+          PR_BODY="$PR_BODY"$'\n'"- Automated sync from subrepo remotes"
+          PR_BODY="$PR_BODY"$'\n'"- Generated on: $(date)"
+          PR_BODY="$PR_BODY"$'\n'"- Triggered by: ${{ github.event_name }}"
+          PR_BODY="$PR_BODY"$'\n\n'"## Review"
+          PR_BODY="$PR_BODY"$'\n'"Please review the changes before merging. If there are conflicts, they will need to be resolved manually."
+          PR_BODY="$PR_BODY"$'\n\n'"---"
+          PR_BODY="$PR_BODY"$'\n'"*This PR was automatically generated by the subrepo sync workflow.*"
+
+          gh pr create \
+            --title "🔄 Sync: Update from subrepos" \
+            --body "$PR_BODY" \
+            --base main \
+            --head "$BRANCH_NAME" \
+            --label "sync" \
+            --label "automated"
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+
+      - name: Push changes directly if no PR needed
+        if: steps.pull.outputs.has_changes == 'true' && github.event_name == 'workflow_dispatch'
+        run: |
+          # For manual triggers, optionally push directly
+          if [ "${{ github.event.inputs.subrepo_filter }}" != "" ]; then
+            echo "Pushing filtered changes directly to main..."
+            git push origin main
+          fi
+
+  check-conflicts:
+    needs: pull-changes
+    runs-on: ubuntu-latest
+    name: Check for conflicts
+    if: failure()
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Create conflict resolution issue
+        run: |
+          ISSUE_BODY="Conflicts were detected during the automated subrepo sync process."
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Details"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"- **Time:** $(date)"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"- **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Required Action"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"Manual intervention is required to resolve the conflicts. Please:"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"1. Review the workflow logs"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"2. Manually sync the affected repositories"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"3. Resolve any conflicts"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"4. Close this issue when resolved"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"---"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"*This issue was automatically created by the subrepo sync workflow.*"
+
+          gh issue create \
+            --title "⚠️ Subrepo sync conflicts detected" \
+            --body "$ISSUE_BODY" \
+            --label "conflict" \
+            --label "needs-attention"
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}

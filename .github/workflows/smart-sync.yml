@@ -1,0 +1,547 @@
+name: Smart Sync - Auto-detect and Bootstrap
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    # Don't ignore config changes - we want to detect new repositories
+    paths-ignore:
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+      - 'README.md'
+      - 'CLAUDE.md'
+      - '.claude/**'
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+jobs:
+  analyze-changes:
+    runs-on: ubuntu-latest
+    name: Analyze changes and determine actions
+    outputs:
+      has_resource_changes: ${{ steps.analyze.outputs.has_resource_changes }}
+      has_config_changes: ${{ steps.analyze.outputs.has_config_changes }}
+      needs_bootstrap: ${{ steps.analyze.outputs.needs_bootstrap }}
+      changed_subrepos: ${{ steps.analyze.outputs.changed_subrepos }}
+      new_repositories: ${{ steps.analyze.outputs.new_repositories }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Analyze changes
+        id: analyze
+        run: |
+          # Determine commit range
+          if [ "${{ github.event_name }}" = "push" ]; then
+            if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+              COMMIT_RANGE="${{ github.sha }}"
+            else
+              COMMIT_RANGE="${{ github.event.before }}..${{ github.sha }}"
+            fi
+          else
+            COMMIT_RANGE="HEAD~1..HEAD"
+          fi
+
+          echo "Analyzing commit range: $COMMIT_RANGE"
+
+          # Get changed files
+          if [[ "$COMMIT_RANGE" == *".."* ]]; then
+            CHANGED_FILES=$(git diff --name-only $COMMIT_RANGE || git diff --name-only HEAD~1..HEAD)
+          else
+            CHANGED_FILES=$(git diff-tree --no-commit-id --name-only -r $COMMIT_RANGE || git diff --name-only HEAD~1..HEAD)
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+
+          # Initialize flags
+          HAS_RESOURCE_CHANGES=false
+          HAS_CONFIG_CHANGES=false
+          NEEDS_BOOTSTRAP=false
+
+          # Check for configuration changes
+          if echo "$CHANGED_FILES" | grep -q "^\.github/subrepo-config\.json$"; then
+            echo "✓ Configuration file changed"
+            HAS_CONFIG_CHANGES=true
+            NEEDS_BOOTSTRAP=true
+          fi
+
+          # Check for resource changes
+          if echo "$CHANGED_FILES" | grep -q "^resources/"; then
+            echo "✓ Resource files changed"
+            HAS_RESOURCE_CHANGES=true
+          fi
+
+          # Check if resource directories are missing .git initialization
+          # This triggers bootstrap when resource directories exist but lack git initialization
+          echo "Checking for uninitialized resource directories..."
+          TEMP_MISSING=$(mktemp)
+
+          jq -c '.subrepos[]' .github/subrepo-config.json | while IFS= read -r subrepo; do
+            prefix=$(echo "$subrepo" | jq -r '.prefix')
+
+            # Check if directory exists and has files but no .git
+            if [ -d "$prefix" ] && [ "$(ls -A "$prefix" 2>/dev/null)" ]; then
+              if [ ! -d "$prefix/.git" ]; then
+                echo "⚠ Missing .git in: $prefix"
+                echo "$prefix" >> "$TEMP_MISSING"
+              fi
+            elif [ ! -d "$prefix" ]; then
+              echo "⚠ Missing directory: $prefix"
+              echo "$prefix" >> "$TEMP_MISSING"
+            fi
+          done
+
+          # Count missing and set bootstrap flag if any resource directories need git initialization
+          MISSING_GIT_COUNT=$(wc -l < "$TEMP_MISSING" 2>/dev/null || echo "0")
+          if [ "$MISSING_GIT_COUNT" -gt 0 ]; then
+            echo "✓ Found $MISSING_GIT_COUNT resource directories needing git initialization"
+            NEEDS_BOOTSTRAP=true
+
+            # Create NEW_REPOSITORIES array for directories that need repository creation
+            echo "Building list of repositories to create..."
+            MISSING_REPO_CONFIGS=()
+            while IFS= read -r missing_prefix; do
+              if [ -n "$missing_prefix" ]; then
+                # Find the configuration for this prefix
+                CONFIG=$(jq -c ".subrepos[] | select(.prefix == \"$missing_prefix\")" .github/subrepo-config.json)
+                if [ -n "$CONFIG" ] && [ "$CONFIG" != "null" ]; then
+                  MISSING_REPO_CONFIGS+=("$CONFIG")
+                  echo "  - Will create repository for: $missing_prefix"
+                fi
+              fi
+            done < "$TEMP_MISSING"
+
+            if [ ${#MISSING_REPO_CONFIGS[@]} -gt 0 ]; then
+              REPOSITORIES_FOR_CREATION=$(printf '%s\n' "${MISSING_REPO_CONFIGS[@]}" | jq -s -c .)
+              echo "✓ Prepared $MISSING_GIT_COUNT repositories for creation"
+            else
+              REPOSITORIES_FOR_CREATION="[]"
+            fi
+          else
+            echo "✓ All resource directories have proper git initialization"
+            REPOSITORIES_FOR_CREATION="[]"
+          fi
+
+          # Cleanup
+          rm -f "$TEMP_MISSING"
+
+          # Detect new repositories from config changes
+          NEW_REPOSITORIES="[]"
+          if [ "$HAS_CONFIG_CHANGES" = "true" ]; then
+            echo "Analyzing new repositories in configuration..."
+
+            # Get current config
+            CURRENT_PREFIXES=$(jq -r '.subrepos[].prefix' .github/subrepo-config.json | sort)
+
+            # Get previous config if it exists
+            if git show HEAD~1:.github/subrepo-config.json >/dev/null 2>&1; then
+              PREVIOUS_PREFIXES=$(git show HEAD~1:.github/subrepo-config.json | jq -r '.subrepos[].prefix' | sort)
+
+              # Find new prefixes
+              NEW_PREFIXES=$(comm -13 <(echo "$PREVIOUS_PREFIXES") <(echo "$CURRENT_PREFIXES"))
+
+              if [ -n "$NEW_PREFIXES" ]; then
+                echo "New repositories detected:"
+                echo "$NEW_PREFIXES"
+
+                # Build JSON array of new repository configs
+                NEW_REPO_CONFIGS=()
+                while IFS= read -r prefix; do
+                  if [ -n "$prefix" ]; then
+                    CONFIG=$(jq -c ".subrepos[] | select(.prefix == \"$prefix\")" .github/subrepo-config.json)
+                    NEW_REPO_CONFIGS+=("$CONFIG")
+                  fi
+                done <<< "$NEW_PREFIXES"
+
+                if [ ${#NEW_REPO_CONFIGS[@]} -gt 0 ]; then
+                  NEW_REPOSITORIES=$(printf '%s\n' "${NEW_REPO_CONFIGS[@]}" | jq -s -c .)
+                fi
+              fi
+            else
+              echo "First time configuration - all repositories are new"
+              NEW_REPOSITORIES=$(jq -c '.subrepos' .github/subrepo-config.json)
+            fi
+          fi
+
+          # Detect changed subrepos (existing logic)
+          CHANGED_SUBREPOS="[]"
+          if [ "$HAS_RESOURCE_CHANGES" = "true" ]; then
+            TEMP_SUBREPOS=$(mktemp)
+
+            while IFS= read -r file; do
+              if [ -z "$file" ]; then continue; fi
+
+              jq -c '.subrepos[]' .github/subrepo-config.json | while IFS= read -r subrepo; do
+                prefix=$(echo "$subrepo" | jq -r '.prefix')
+
+                if [[ "$file" == "$prefix/"* ]] || [[ "$file" == "$prefix" ]]; then
+                  echo "$subrepo" >> "$TEMP_SUBREPOS"
+                  break
+                fi
+              done
+            done <<< "$CHANGED_FILES"
+
+            if [ -s "$TEMP_SUBREPOS" ]; then
+              CHANGED_SUBREPOS=$(sort -u "$TEMP_SUBREPOS" | jq -R . | jq -s -c .)
+            fi
+
+            rm -f "$TEMP_SUBREPOS"
+          fi
+
+          # Merge repositories that need creation with new repositories from config changes
+          if [ "$REPOSITORIES_FOR_CREATION" != "[]" ] && [ -n "$REPOSITORIES_FOR_CREATION" ]; then
+            echo "Merging repositories that need creation with new repositories..."
+            if [ "$NEW_REPOSITORIES" = "[]" ] || [ -z "$NEW_REPOSITORIES" ]; then
+              NEW_REPOSITORIES="$REPOSITORIES_FOR_CREATION"
+            else
+              # Merge both arrays and remove duplicates by prefix
+              NEW_REPOSITORIES=$(echo "$NEW_REPOSITORIES $REPOSITORIES_FOR_CREATION" | jq -s -c 'add | unique_by(.prefix)')
+            fi
+            echo "✓ Final NEW_REPOSITORIES count: $(echo "$NEW_REPOSITORIES" | jq length)"
+          fi
+
+          # Validate JSON before setting outputs
+          echo "Validating JSON outputs..."
+
+          if ! echo "$CHANGED_SUBREPOS" | jq empty 2>/dev/null; then
+            echo "⚠️ Invalid CHANGED_SUBREPOS JSON, resetting to empty array"
+            CHANGED_SUBREPOS="[]"
+          fi
+
+          if ! echo "$NEW_REPOSITORIES" | jq empty 2>/dev/null; then
+            echo "⚠️ Invalid NEW_REPOSITORIES JSON, resetting to empty array"
+            NEW_REPOSITORIES="[]"
+          fi
+
+          if [ -n "$REPOSITORIES_FOR_CREATION" ] && ! echo "$REPOSITORIES_FOR_CREATION" | jq empty 2>/dev/null; then
+            echo "⚠️ Invalid REPOSITORIES_FOR_CREATION JSON, resetting to empty array"
+            REPOSITORIES_FOR_CREATION="[]"
+          fi
+
+          # Set outputs
+          echo "has_resource_changes=$HAS_RESOURCE_CHANGES" >> $GITHUB_OUTPUT
+          echo "has_config_changes=$HAS_CONFIG_CHANGES" >> $GITHUB_OUTPUT
+          echo "needs_bootstrap=$NEEDS_BOOTSTRAP" >> $GITHUB_OUTPUT
+          echo "changed_subrepos=$CHANGED_SUBREPOS" >> $GITHUB_OUTPUT
+          echo "new_repositories=$NEW_REPOSITORIES" >> $GITHUB_OUTPUT
+
+          echo "Analysis complete:"
+          echo "- Resource changes: $HAS_RESOURCE_CHANGES"
+          echo "- Config changes: $HAS_CONFIG_CHANGES"
+          echo "- Needs bootstrap: $NEEDS_BOOTSTRAP"
+          echo "- Missing git initialization: $MISSING_GIT_COUNT directories"
+          echo "- New repositories: $(echo "$NEW_REPOSITORIES" | jq length)"
+          echo "- Changed subrepos: $(echo "$CHANGED_SUBREPOS" | jq length)"
+
+  auto-bootstrap-new:
+    needs: analyze-changes
+    if: needs.analyze-changes.outputs.needs_bootstrap == 'true'
+    runs-on: ubuntu-latest
+    name: Auto-bootstrap new repositories
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "GitHub Actions [Smart-Sync]"
+          git config --global user.email "actions@github.com"
+
+      - name: Create new remote repositories
+        run: |
+          echo "Creating remote repositories for new entries..."
+          NEW_REPOS='${{ needs.analyze-changes.outputs.new_repositories }}'
+
+          if [ "$NEW_REPOS" != "[]" ]; then
+            echo "$NEW_REPOS" | jq -c '.[]' | while IFS= read -r repo_config; do
+              prefix=$(echo "$repo_config" | jq -r '.prefix')
+              remote=$(echo "$repo_config" | jq -r '.remote')
+
+              repo_owner=$(echo "$remote" | sed -E 's|.*github\.com[:/]([^/]+)/.*|\1|')
+              repo_name=$(echo "$remote" | sed -E 's|.*/([^/]+)\.git$|\1|')
+
+              echo "Creating repository: $repo_owner/$repo_name for $prefix"
+
+              if ! gh repo view "$repo_owner/$repo_name" &>/dev/null; then
+                gh repo create "$repo_owner/$repo_name" \
+                  --private \
+                  --description "Auto-created subrepo for $prefix" \
+                  || echo "⚠ Failed to create $repo_owner/$repo_name"
+              else
+                echo "✓ Repository already exists: $repo_owner/$repo_name"
+              fi
+            done
+          else
+            echo "No new repositories to create"
+          fi
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+
+      - name: Initialize local directories
+        run: |
+          echo "Initializing local directories for new repositories..."
+          NEW_REPOS='${{ needs.analyze-changes.outputs.new_repositories }}'
+
+          if [ "$NEW_REPOS" != "[]" ]; then
+            echo "$NEW_REPOS" | jq -c '.[]' | while IFS= read -r repo_config; do
+              prefix=$(echo "$repo_config" | jq -r '.prefix')
+
+              if [ ! -d "$prefix" ] || [ -z "$(ls -A "$prefix" 2>/dev/null)" ]; then
+                echo "Creating directory structure: $prefix"
+                mkdir -p "$prefix"
+                echo "# $prefix" > "$prefix/README.md"
+                echo "✓ Initialized $prefix"
+              else
+                echo "✓ Directory already exists: $prefix"
+              fi
+            done
+          fi
+
+      - name: Commit new directory structure
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "$(cat <<'EOF'
+          feat: initialize new resource directories
+
+          Auto-created directory structure for new repositories.
+
+          🤖 Generated by Smart-Sync automation
+          [skip ci]
+          EOF
+          )"
+            git push origin main
+            echo "✅ New directories committed and pushed"
+          else
+            echo "ℹ️ No new directories to commit"
+          fi
+
+  prepare-sync:
+    needs: [analyze-changes, auto-bootstrap-new]
+    if: always() && (needs.analyze-changes.outputs.has_resource_changes == 'true' || needs.auto-bootstrap-new.result == 'success')
+    runs-on: ubuntu-latest
+    name: Prepare repositories for sync
+    outputs:
+      repositories_to_sync: ${{ steps.prepare.outputs.repositories_to_sync }}
+      has_repositories: ${{ steps.prepare.outputs.has_repositories }}
+
+    steps:
+      - name: Prepare repository list for syncing
+        id: prepare
+        run: |
+          echo "Preparing repository list for syncing..."
+
+          CHANGED_REPOS='${{ needs.analyze-changes.outputs.changed_subrepos }}'
+          NEW_REPOS='${{ needs.analyze-changes.outputs.new_repositories }}'
+
+          echo "Changed repos: $CHANGED_REPOS"
+          echo "New repos: $NEW_REPOS"
+
+          # Combine changed and new repositories
+          REPOS_TO_SYNC="[]"
+
+          # Add changed repositories if any
+          if [ "$CHANGED_REPOS" != "[]" ] && [ "$CHANGED_REPOS" != "null" ] && [ -n "$CHANGED_REPOS" ]; then
+            REPOS_TO_SYNC="$CHANGED_REPOS"
+          fi
+
+          # Add new repositories if any, merging with existing list
+          if [ "$NEW_REPOS" != "[]" ] && [ "$NEW_REPOS" != "null" ] && [ -n "$NEW_REPOS" ]; then
+            if [ "$REPOS_TO_SYNC" = "[]" ]; then
+              REPOS_TO_SYNC="$NEW_REPOS"
+            else
+              # Merge the two arrays
+              REPOS_TO_SYNC=$(echo "$REPOS_TO_SYNC $NEW_REPOS" | jq -s -c 'add | unique_by(.prefix)')
+            fi
+          fi
+
+          # Check if we have any repositories to sync
+          REPO_COUNT=$(echo "$REPOS_TO_SYNC" | jq length)
+
+          if [ "$REPO_COUNT" -gt 0 ]; then
+            HAS_REPOSITORIES="true"
+            echo "✓ Found $REPO_COUNT repositories to sync"
+          else
+            HAS_REPOSITORIES="false"
+            REPOS_TO_SYNC="[]"
+            echo "ℹ️ No repositories to sync"
+          fi
+
+          # Validate JSON before output
+          if ! echo "$REPOS_TO_SYNC" | jq empty 2>/dev/null; then
+            echo "⚠️ Invalid REPOS_TO_SYNC JSON, resetting to empty array"
+            REPOS_TO_SYNC="[]"
+            HAS_REPOSITORIES="false"
+          fi
+
+          echo "repositories_to_sync=$REPOS_TO_SYNC" >> $GITHUB_OUTPUT
+          echo "has_repositories=$HAS_REPOSITORIES" >> $GITHUB_OUTPUT
+
+          echo "Final repository list:"
+          echo "$REPOS_TO_SYNC" | jq . || echo "$REPOS_TO_SYNC"
+
+  sync-changes:
+    needs: [analyze-changes, auto-bootstrap-new, prepare-sync]
+    if: needs.prepare-sync.outputs.has_repositories == 'true'
+    runs-on: ubuntu-latest
+    name: Sync changes to subrepos
+    strategy:
+      matrix:
+        subrepo: ${{ fromJson(needs.prepare-sync.outputs.repositories_to_sync) }}
+      max-parallel: 10
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "GitHub Actions [Smart-Sync]"
+          git config --global user.email "actions@github.com"
+
+      - name: Parse subrepo info
+        id: parse
+        run: |
+          SUBREPO='${{ matrix.subrepo }}'
+          PREFIX=$(echo "$SUBREPO" | jq -r '.prefix')
+          REMOTE=$(echo "$SUBREPO" | jq -r '.remote')
+          BRANCH=$(echo "$SUBREPO" | jq -r '.branch')
+
+          REPO_NAME=$(echo "$REMOTE" | sed -E 's|.*/([^/]+)\.git$|\1|')
+          REPO_OWNER=$(echo "$REMOTE" | sed -E 's|.*github\.com[:/]([^/]+)/.*|\1|')
+
+          echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
+          echo "remote=$REMOTE" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+          echo "repo_owner=$REPO_OWNER" >> $GITHUB_OUTPUT
+
+      - name: Sync to remote repository
+        run: |
+          PREFIX="${{ steps.parse.outputs.prefix }}"
+          REMOTE="${{ steps.parse.outputs.remote }}"
+          BRANCH="${{ steps.parse.outputs.branch }}"
+
+          echo "Syncing $PREFIX to $REMOTE"
+
+          # Ensure source directory exists
+          if [ ! -d "$PREFIX" ]; then
+            echo "❌ Source directory does not exist: $PREFIX"
+            exit 1
+          fi
+
+          # Create temporary directory for subrepo
+          TEMP_REPO=$(mktemp -d)
+
+          # Try to clone existing repo, or initialize if it doesn't exist
+          if ! git clone "$REMOTE" "$TEMP_REPO" 2>/dev/null; then
+            echo "Initializing new repository"
+            git init "$TEMP_REPO"
+            cd "$TEMP_REPO"
+            git checkout -b "$BRANCH"
+            git remote add origin "$REMOTE"
+          else
+            cd "$TEMP_REPO"
+            git checkout "$BRANCH" || git checkout -b "$BRANCH"
+          fi
+
+          # Copy files from monorepo to subrepo
+          cd "${{ github.workspace }}"
+
+          # Clear existing files in temp repo (except .git)
+          find "$TEMP_REPO" -mindepth 1 -maxdepth 1 -name ".git" -prune -o -exec rm -rf {} + 2>/dev/null || true
+
+          # Copy all files from prefix directory
+          cp -r "$PREFIX"/* "$TEMP_REPO/" 2>/dev/null || true
+          cp -r "$PREFIX"/.[^.]* "$TEMP_REPO/" 2>/dev/null || true
+
+          # Commit and push changes
+          cd "$TEMP_REPO"
+          git add -A
+
+          if [ -n "$(git status --porcelain)" ]; then
+            # Get the last commit message from the monorepo
+            cd "${{ github.workspace }}"
+            COMMIT_MSG=$(git log -1 --pretty=%B)
+
+            cd "$TEMP_REPO"
+            FULL_COMMIT_MSG="$COMMIT_MSG"$'\n\n'"🔄 Synced from monorepo: ${{ github.repository }}@${{ github.sha }}"
+            git commit -m "$FULL_COMMIT_MSG"
+
+            git push origin "$BRANCH" --force-with-lease || {
+              echo "❌ Failed to push changes"
+              exit 1
+            }
+
+            echo "✅ Successfully synced $PREFIX to $REMOTE"
+          else
+            echo "ℹ️ No changes to sync for $PREFIX"
+          fi
+
+          # Cleanup
+          rm -rf "$TEMP_REPO"
+
+  summary:
+    needs: [analyze-changes, auto-bootstrap-new, sync-changes]
+    if: always()
+    runs-on: ubuntu-latest
+    name: Smart-Sync Summary
+
+    steps:
+      - name: Create summary
+        run: |
+          echo "# 🔄 Smart-Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Author:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Time:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Analysis results
+          echo "## 📊 Analysis Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Resource changes:** ${{ needs.analyze-changes.outputs.has_resource_changes }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Config changes:** ${{ needs.analyze-changes.outputs.has_config_changes }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bootstrap needed:** ${{ needs.analyze-changes.outputs.needs_bootstrap }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # New repositories
+          NEW_REPOS='${{ needs.analyze-changes.outputs.new_repositories }}'
+          if [ "$NEW_REPOS" != "[]" ]; then
+            echo "## 🆕 New Repositories" >> $GITHUB_STEP_SUMMARY
+            echo "Automatically created and initialized:" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            echo "$NEW_REPOS" | jq . >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Changed repositories
+          CHANGED_REPOS='${{ needs.analyze-changes.outputs.changed_subrepos }}'
+          if [ "$CHANGED_REPOS" != "[]" ]; then
+            echo "## 📝 Updated Repositories" >> $GITHUB_STEP_SUMMARY
+            echo "Synced changes to existing repositories:" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            echo "$CHANGED_REPOS" | jq . >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Status summary
+          echo "## ✅ Status" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bootstrap:** ${{ needs.auto-bootstrap-new.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sync:** ${{ needs.sync-changes.result }}" >> $GITHUB_STEP_SUMMARY

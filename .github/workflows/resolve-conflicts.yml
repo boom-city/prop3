@@ -1,0 +1,393 @@
+name: Resolve Subrepo Conflicts
+
+on:
+  workflow_dispatch:
+    inputs:
+      conflict_type:
+        description: 'Type of conflict to resolve'
+        required: true
+        default: 'merge'
+        type: choice
+        options:
+          - 'merge'
+          - 'rebase'
+          - 'manual'
+      subrepo_prefix:
+        description: 'Specific subrepo prefix (leave empty for all)'
+        required: false
+        default: ''
+      strategy:
+        description: 'Resolution strategy'
+        required: true
+        default: 'theirs'
+        type: choice
+        options:
+          - 'ours'
+          - 'theirs'
+          - 'manual'
+
+  # Triggered by other workflows when conflicts are detected
+  repository_dispatch:
+    types: [resolve-conflict]
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+
+jobs:
+  detect-conflicts:
+    runs-on: ubuntu-latest
+    name: Detect and analyze conflicts
+    outputs:
+      has_conflicts: ${{ steps.detect.outputs.has_conflicts }}
+      conflict_details: ${{ steps.detect.outputs.conflict_details }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Detect conflicts
+        id: detect
+        run: |
+          cat > detect-conflicts.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          CONFIG_FILE=".github/subrepo-config.json"
+          SUBREPO_FILTER="${{ github.event.inputs.subrepo_prefix }}"
+          CONFLICT_REPORT="conflict-report.json"
+
+          echo "Detecting conflicts in subrepos..."
+
+          # Initialize conflict report
+          echo '{"conflicts": []}' > "$CONFLICT_REPORT"
+
+          # Function to check for conflicts in a subrepo
+          check_subrepo_conflicts() {
+              local prefix="$1"
+              local remote="$2"
+              local branch="$3"
+
+              echo "Checking: $prefix"
+
+              # Skip if filter is set and doesn't match
+              if [ -n "$SUBREPO_FILTER" ] && [[ "$prefix" != *"$SUBREPO_FILTER"* ]]; then
+                  return 0
+              fi
+
+              # Create temporary directory
+              TEMP_DIR=$(mktemp -d)
+              trap "rm -rf $TEMP_DIR" EXIT
+
+              # Clone the remote
+              if ! git clone --branch "$branch" "$remote" "$TEMP_DIR" 2>/dev/null; then
+                  echo "⚠ Cannot access remote: $remote"
+                  return 0
+              fi
+
+              # Compare with local
+              cd "$TEMP_DIR"
+              LOCAL_FILES=$(find "${{ github.workspace }}/$prefix" -type f -not -path "*/.git/*" 2>/dev/null | sed "s|${{ github.workspace }}/$prefix/||g" | sort)
+              REMOTE_FILES=$(find . -type f -not -path "*/.git/*" | sed "s|^\./||g" | sort)
+
+              # Check for file differences
+              CONFLICTS=false
+              CONFLICT_FILES=()
+
+              while IFS= read -r file; do
+                  if [ -f "${{ github.workspace }}/$prefix/$file" ] && [ -f "$file" ]; then
+                      if ! diff -q "${{ github.workspace }}/$prefix/$file" "$file" >/dev/null 2>&1; then
+                          CONFLICTS=true
+                          CONFLICT_FILES+=("$file")
+                      fi
+                  fi
+              done <<< "$REMOTE_FILES"
+
+              if [ "$CONFLICTS" = "true" ]; then
+                  # Add to conflict report
+                  cd "${{ github.workspace }}"
+                  jq --arg prefix "$prefix" \
+                     --arg remote "$remote" \
+                     --argjson files "$(printf '%s\n' "${CONFLICT_FILES[@]}" | jq -R . | jq -s .)" \
+                     '.conflicts += [{
+                        "prefix": $prefix,
+                        "remote": $remote,
+                        "files": $files,
+                        "conflict_type": "content"
+                     }]' "$CONFLICT_REPORT" > tmp.json && mv tmp.json "$CONFLICT_REPORT"
+              fi
+
+              rm -rf "$TEMP_DIR"
+          }
+
+          # Process all subrepos
+          jq -c '.subrepos[]' "$CONFIG_FILE" | while IFS= read -r subrepo; do
+              prefix=$(echo "$subrepo" | jq -r '.prefix')
+              remote=$(echo "$subrepo" | jq -r '.remote')
+              branch=$(echo "$subrepo" | jq -r '.branch')
+
+              check_subrepo_conflicts "$prefix" "$remote" "$branch"
+          done
+
+          # Check if we have conflicts
+          CONFLICT_COUNT=$(jq '.conflicts | length' "$CONFLICT_REPORT")
+
+          if [ "$CONFLICT_COUNT" -gt 0 ]; then
+              echo "Found conflicts in $CONFLICT_COUNT subrepos"
+              echo "has_conflicts=true" >> $GITHUB_OUTPUT
+
+              # Output conflict details
+              CONFLICT_DETAILS=$(jq -c . "$CONFLICT_REPORT")
+              echo "conflict_details=$CONFLICT_DETAILS" >> $GITHUB_OUTPUT
+          else
+              echo "No conflicts detected"
+              echo "has_conflicts=false" >> $GITHUB_OUTPUT
+              echo "conflict_details={}" >> $GITHUB_OUTPUT
+          fi
+          EOF
+          chmod +x detect-conflicts.sh
+          ./detect-conflicts.sh
+
+  resolve-conflicts:
+    needs: detect-conflicts
+    if: needs.detect-conflicts.outputs.has_conflicts == 'true'
+    runs-on: ubuntu-latest
+    name: Resolve detected conflicts
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+
+      - name: Create resolution branch
+        id: create_branch
+        run: |
+          RESOLUTION_BRANCH="resolve-conflicts-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$RESOLUTION_BRANCH"
+          echo "branch=$RESOLUTION_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Apply resolution strategy
+        run: |
+          cat > resolve-conflicts.sh << 'EOF'
+          #!/bin/bash
+          set -e
+
+          STRATEGY="${{ github.event.inputs.strategy }}"
+          CONFLICT_DETAILS='${{ needs.detect-conflicts.outputs.conflict_details }}'
+          RESOLUTION_LOG="resolution-log.txt"
+
+          echo "Applying resolution strategy: $STRATEGY"
+          > "$RESOLUTION_LOG"
+
+          # Function to resolve conflicts for a subrepo
+          resolve_subrepo() {
+              local prefix="$1"
+              local remote="$2"
+              local strategy="$3"
+
+              echo "Resolving conflicts for: $prefix"
+              echo "Strategy: $strategy"
+
+              # Create temporary directory
+              TEMP_DIR=$(mktemp -d)
+              trap "rm -rf $TEMP_DIR" EXIT
+
+              # Clone the remote
+              if ! git clone "$remote" "$TEMP_DIR" 2>/dev/null; then
+                  echo "⚠ Cannot access remote: $remote"
+                  return 1
+              fi
+
+              case "$strategy" in
+                  "ours")
+                      echo "Keeping local version (ours)"
+                      # No action needed, local version stays
+                      echo "✓ Kept local version for $prefix" >> "$RESOLUTION_LOG"
+                      ;;
+
+                  "theirs")
+                      echo "Taking remote version (theirs)"
+                      # Copy remote files to local
+                      rsync -a --delete \
+                            --exclude='.git' \
+                            "$TEMP_DIR/" "$prefix/"
+                      echo "✓ Took remote version for $prefix" >> "$RESOLUTION_LOG"
+                      ;;
+
+                  "manual")
+                      echo "Manual resolution required for $prefix"
+                      # Create conflict markers in files
+                      echo "⚠ Manual resolution needed for $prefix" >> "$RESOLUTION_LOG"
+
+                      # For each conflicted file, create a .conflict file
+                      cd "$TEMP_DIR"
+                      find . -type f -not -path "*/.git/*" | while read -r file; do
+                          file="${file#./}"
+                          LOCAL_FILE="${{ github.workspace }}/$prefix/$file"
+                          REMOTE_FILE="$file"
+
+                          if [ -f "$LOCAL_FILE" ] && [ -f "$REMOTE_FILE" ]; then
+                              if ! diff -q "$LOCAL_FILE" "$REMOTE_FILE" >/dev/null 2>&1; then
+                                  # Create conflict file
+                                  CONFLICT_FILE="$LOCAL_FILE.conflict"
+                                  {
+                                      echo "<<<<<<< LOCAL (monorepo)"
+                                      cat "$LOCAL_FILE"
+                                      echo "======="
+                                      cat "$REMOTE_FILE"
+                                      echo ">>>>>>> REMOTE (subrepo: $remote)"
+                                  } > "$CONFLICT_FILE"
+                              fi
+                          fi
+                      done
+                      ;;
+              esac
+
+              rm -rf "$TEMP_DIR"
+          }
+
+          # Process conflicts
+          echo "$CONFLICT_DETAILS" | jq -c '.conflicts[]' | while IFS= read -r conflict; do
+              prefix=$(echo "$conflict" | jq -r '.prefix')
+              remote=$(echo "$conflict" | jq -r '.remote')
+
+              resolve_subrepo "$prefix" "$remote" "$STRATEGY"
+          done
+
+          echo "Resolution complete. Summary:"
+          cat "$RESOLUTION_LOG"
+          EOF
+          chmod +x resolve-conflicts.sh
+          ./resolve-conflicts.sh
+
+      - name: Commit resolution
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            RESOLUTION_MSG="resolve: Apply ${{ github.event.inputs.strategy }} strategy for conflicts"
+            RESOLUTION_MSG="$RESOLUTION_MSG"$'\n\n'"Resolution type: ${{ github.event.inputs.conflict_type }}"
+            RESOLUTION_MSG="$RESOLUTION_MSG"$'\n'"Strategy: ${{ github.event.inputs.strategy }}"
+            RESOLUTION_MSG="$RESOLUTION_MSG"$'\n'"Triggered by: ${{ github.actor }}"
+            RESOLUTION_MSG="$RESOLUTION_MSG"$'\n\n'"[skip ci]"
+            git commit -m "$RESOLUTION_MSG"
+          else
+            echo "No changes to commit after resolution"
+          fi
+
+      - name: Push resolution branch
+        run: |
+          RESOLUTION_BRANCH="${{ steps.create_branch.outputs.branch }}"
+          git push origin "$RESOLUTION_BRANCH"
+
+      - name: Create pull request
+        run: |
+          RESOLUTION_BRANCH="${{ steps.create_branch.outputs.branch }}"
+          CONFLICT_DETAILS='${{ needs.detect-conflicts.outputs.conflict_details }}'
+
+          # Create detailed PR body
+          PR_BODY="## 🔧 Conflict Resolution"
+          PR_BODY="$PR_BODY"$'\n\n'"This PR resolves conflicts detected between the monorepo and subrepos."
+          PR_BODY="$PR_BODY"$'\n\n'"### Resolution Details"
+          PR_BODY="$PR_BODY"$'\n'"- **Type:** ${{ github.event.inputs.conflict_type }}"
+          PR_BODY="$PR_BODY"$'\n'"- **Strategy:** ${{ github.event.inputs.strategy }}"
+          PR_BODY="$PR_BODY"$'\n'"- **Triggered by:** ${{ github.actor }}"
+          PR_BODY="$PR_BODY"$'\n'"- **Time:** $(date)"
+          PR_BODY="$PR_BODY"$'\n\n'"### Conflicts Resolved"
+
+          # Add conflict details to PR body
+          echo "$CONFLICT_DETAILS" | jq -r '.conflicts[] | "- **\(.prefix)**: \(.files | length) files"' >> pr_body.txt
+
+          PR_BODY="$PR_BODY"$'\n'"$(cat pr_body.txt)"
+          PR_BODY="$PR_BODY"$'\n\n'"### Resolution Strategy"$'\n'
+
+          case "${{ github.event.inputs.strategy }}" in
+              "ours")
+                  PR_BODY="$PR_BODY"$'\n'"✅ **Kept local (monorepo) version** - All conflicts resolved by keeping the monorepo version."
+                  ;;
+              "theirs")
+                  PR_BODY="$PR_BODY"$'\n'"✅ **Took remote (subrepo) version** - All conflicts resolved by taking the subrepo version."
+                  ;;
+              "manual")
+                  PR_BODY="$PR_BODY"$'\n'"⚠️ **Manual resolution required** - Conflict markers have been added to affected files. Please review and resolve manually."
+                  ;;
+          esac
+
+          PR_BODY="$PR_BODY"$'\n\n'"### Next Steps"
+          PR_BODY="$PR_BODY"$'\n'"1. Review the changes in this PR"
+          PR_BODY="$PR_BODY"$'\n'"2. Verify the resolution is correct"
+          PR_BODY="$PR_BODY"$'\n'"3. Merge to apply the resolution"
+          PR_BODY="$PR_BODY"$'\n'"4. Changes will be synced to subrepos automatically"
+          PR_BODY="$PR_BODY"$'\n\n'"---"
+          PR_BODY="$PR_BODY"$'\n'"*This PR was automatically generated by the conflict resolution workflow.*"
+
+          gh pr create \
+            --title "🔧 Resolve conflicts: ${{ github.event.inputs.strategy }} strategy" \
+            --body "$PR_BODY" \
+            --base main \
+            --head "$RESOLUTION_BRANCH" \
+            --label "conflict-resolution" \
+            --label "automated"
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
+
+  manual-review:
+    needs: [detect-conflicts, resolve-conflicts]
+    if: github.event.inputs.strategy == 'manual'
+    runs-on: ubuntu-latest
+    name: Create manual review checklist
+
+    steps:
+      - name: Create review issue
+        run: |
+          CONFLICT_DETAILS='${{ needs.detect-conflicts.outputs.conflict_details }}'
+
+          # Create issue for manual review
+          ISSUE_BODY="Manual conflict resolution is required for the following subrepos:"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Conflicts Requiring Resolution"
+
+          # Add checklist items
+          echo "$CONFLICT_DETAILS" | jq -r '.conflicts[] | "- [ ] **\(.prefix)**\n  - Remote: \(.remote)\n  - Files: \(.files | join(", "))"' >> issue_body.txt
+
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"$(cat issue_body.txt)"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Resolution Instructions"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"1. Check out the resolution branch created by this workflow"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"2. Look for \`.conflict\` files in the affected directories"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"3. Resolve each conflict manually"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"4. Delete the \`.conflict\` files after resolution"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"5. Commit your changes"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"6. Mark items as complete in this checklist"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"## Useful Commands"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"\`\`\`bash"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"# Find all conflict files"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"find . -name '*.conflict' -type f"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"# View a conflict file"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"cat path/to/file.conflict"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"# After resolving, remove conflict file"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"rm path/to/file.conflict"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"\`\`\`"
+          ISSUE_BODY="$ISSUE_BODY"$'\n\n'"---"
+          ISSUE_BODY="$ISSUE_BODY"$'\n'"*This issue was automatically created by the conflict resolution workflow.*"
+
+          gh issue create \
+            --title "📋 Manual conflict resolution required" \
+            --body "$ISSUE_BODY" \
+            --label "conflict-resolution" \
+            --label "manual-review" \
+            --assignee "${{ github.actor }}"
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN }}
