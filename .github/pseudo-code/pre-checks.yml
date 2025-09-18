@@ -28,7 +28,7 @@ FUNCTION check_for_missing_remote_repos():
     remote_list = execute_command("gh repo list boom-city")
     missing_remotes = []
     
-    FOR EACH subrepo IN config.subrepos.remote:
+    FOR EACH subrepo IN config.subrepos:
         IF subrepo.remote_name NOT IN remote_list:
             missing_remotes.add(subrepo)
     
@@ -41,12 +41,12 @@ END FUNCTION
 ```
 FUNCTION create_remote_repo(subrepo):
     TRY:
-        execute_command("gh repo create boom-city/" + subrepo.name)
-        execute_command("gh label create automated boom-city/" + subrepo.name + 
+        execute_command("gh repo create boom-city/" + subrepo.remote_name)
+        execute_command("gh label create automated -R boom-city/" + subrepo.remote_name + 
                        " --color 0000FF --description 'Label for GitHub Actions'")
         RETURN true
     CATCH error:
-        log_error("Failed to create remote repo: " + subrepo.name + " - " + error)
+        log_error("Failed to create remote repo: " + subrepo.remote_name + " - " + error)
         RETURN false
 END FUNCTION
 ```
@@ -59,9 +59,9 @@ FUNCTION create_missing_remote_repos():
     FOR EACH remote IN missing_remotes:
         IF create_remote_repo(remote):
             success_count += 1
-            log_info("Successfully created remote repo: " + remote.name)
+            log_info("Successfully created remote repo: " + remote.remote_name)
         ELSE:
-            log_error("Failed to create remote repo: " + remote.name)
+            log_error("Failed to create remote repo: " + remote.remote_name)
             RETURN failure_result("Failed to create remote repository")
     
     RETURN success_result("Created " + success_count + " remote repositories")

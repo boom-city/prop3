@@ -1,46 +1,55 @@
 {
   "subrepos": [
     {
+      "name": "bmw",
       "prefix": "resources/[addons]/[cars]/bmw",
       "remote": "https://github.com/boom-city/bmw.git",
       "branch": "main"
     },
     {
+      "name": "mercedes",
       "prefix": "resources/[addons]/[cars]/mercedes",
       "remote": "https://github.com/boom-city/mercedes.git",
       "branch": "main"
     },
     {
+      "name": "house_naymar",
       "prefix": "resources/[addons]/house_naymar",
       "remote": "https://github.com/boom-city/house_naymar.git",
       "branch": "main"
     },
     {
+      "name": "prop1",
       "prefix": "resources/[assets]/[props]/prop1",
       "remote": "https://github.com/boom-city/prop1.git",
       "branch": "main"
     },
     {
+      "name": "prop2",
       "prefix": "resources/[assets]/[props]/prop2",
       "remote": "https://github.com/boom-city/prop2.git",
       "branch": "main"
     },
     {
+      "name": "prop3",
       "prefix": "resources/[assets]/[props]/prop3",
       "remote": "https://github.com/boom-city/prop3.git",
       "branch": "main"
     },
     {
+      "name": "map1",
       "prefix": "resources/[maps]/map1",
       "remote": "https://github.com/boom-city/map1.git",
       "branch": "main"
     },
     {
+      "name": "map2",
       "prefix": "resources/[maps]/map2",
       "remote": "https://github.com/boom-city/map2.git",
       "branch": "main"
     },
     {
+      "name": "map3",
       "prefix": "resources/[maps]/map3",
       "remote": "https://github.com/boom-city/map3.git",
       "branch": "main"
