@@ -13,9 +13,7 @@ Run the commands under the `Execute` section to gather information about the pro
 - `get-library-docs`
 
 ## Read
-- .claude/dev-docs/01-system-overview.md
-- .claude/dev-docs/02-developer-workflow.md
-- .claude/dev-docs/03-operations-guide.md
+- .claude/dev-docs/*
 - .github/scripts/*
 - .github/workflows/*
 - .github/subrepo-config.json
