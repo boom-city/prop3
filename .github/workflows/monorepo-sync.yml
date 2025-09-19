@@ -56,14 +56,35 @@ jobs:
         id: plan
         run: |
           # Pseudo-code lines: 24-28 - identify_changed_files()
+          changed_files=""
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            changed_files=$(gh api /repos/${{ github.repository }}/commits/${{ github.sha }}/files --jq '.[].filename')
+            echo "Fetching changed files for push event (commit: ${{ github.sha }})"
+            if changed_files=$(gh api /repos/${{ github.repository }}/commits/${{ github.sha }} --jq '.files[]?.filename // empty' 2>/dev/null); then
+              echo "✅ Successfully fetched commit files"
+            else
+              echo "❌ Failed to fetch commit files, falling back to git diff"
+              changed_files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+            fi
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            changed_files=$(gh api /repos/${{ github.repository }}/pulls/${{ github.event.number }}/files --jq '.[].filename')
+            echo "Fetching changed files for PR event (PR: ${{ github.event.number }})"
+            if changed_files=$(gh api /repos/${{ github.repository }}/pulls/${{ github.event.number }}/files --jq '.[].filename' 2>/dev/null); then
+              echo "✅ Successfully fetched PR files"
+            else
+              echo "❌ Failed to fetch PR files, falling back to git diff"
+              changed_files=$(git diff --name-only origin/${{ github.base_ref }}..HEAD 2>/dev/null || echo "")
+            fi
           fi
 
           echo "Changed files:"
           echo "$changed_files"
+
+          # Validate that we have changed files
+          if [[ -z "$changed_files" ]]; then
+            echo "⚠️ No changed files detected. This may indicate an API error or empty commit."
+            echo "Event: ${{ github.event_name }}"
+            echo "SHA: ${{ github.sha }}"
+            echo "PR Number: ${{ github.event.number }}"
+          fi
 
           # Pseudo-code lines: 30-42 - map_files_to_subrepos()
           subrepo_config=$(cat .github/subrepo-config.json)
